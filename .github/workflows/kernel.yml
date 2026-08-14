@@ -1,22 +1,24 @@
 name: Build Kernel
 
 on:
-  push:
-    branches: [ "**" ]
   workflow_dispatch:
     inputs:
       susfs:
         description: "Integrate SUSFS"
         type: boolean
-        default: true
+        default: false
       clean:
         description: "Ignore ccache and build clean"
         type: boolean
         default: false
-      use_ias:
-        description: "Use clang's integrated assembler instead of GNU as"
-        type: boolean
-        default: false
+      toolchain:
+        description: "Toolchain to build with"
+        type: choice
+        default: proton
+        options:
+          - proton      # LLVM 13 - what 4.19 QCOM kernels were tested with
+          - container   # whatever clang the container ships (LLVM 22 - suspect)
+          - neutron     # latest Neutron Clang
 
 jobs:
   build:
@@ -30,9 +32,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      # NOTE: no "|| true" on the cross-binutils install. Without
-      # aarch64-linux-gnu-as, clang falls back to the host x86 assembler
-      # and dies with "/usr/bin/as: unrecognized option '-EL'".
       - name: Install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
@@ -42,67 +41,82 @@ jobs:
             ccache libncurses-dev python3 device-tree-compiler \
             ca-certificates patch || true
           apt-get install -y --no-install-recommends \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi || true
 
-      - name: Verify cross assembler
+      # 4.19 is end-of-life and was never tested against LLVM 22, which is
+      # what this container ships. Kernels built with it failed to execute
+      # at all - no console, no pstore, no watchdog reset. proton-clang is
+      # LLVM 13 and is what these QCOM 4.19 trees were actually built with.
+      # It also bundles its own aarch64/arm binutils, which clears the
+      # "LSE atomics not supported" and "broken .inst" assembler warnings.
+      - name: Set up toolchain
         run: |
+          case "${{ inputs.toolchain }}" in
+            proton)
+              echo "Fetching proton-clang (LLVM 13)"
+              git clone --depth=1 https://github.com/kdrag0n/proton-clang /opt/proton
+              echo "TC_DIR=/opt/proton" >> $GITHUB_ENV
+              export PATH="/opt/proton/bin:$PATH"
+              ;;
+            container)
+              if command -v clang >/dev/null 2>&1; then
+                echo "TC_DIR=$(dirname "$(dirname "$(command -v clang)")")" >> $GITHUB_ENV
+              fi
+              ;;
+            neutron)
+              mkdir -p /opt/neutron && cd /opt/neutron
+              curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+              chmod +x antman && ./antman -S && ./antman --patch=glibc || true
+              echo "TC_DIR=/opt/neutron" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Show toolchain
+        run: |
+          export PATH="${TC_DIR}/bin:$PATH"
+          echo "TC_DIR=${TC_DIR}"
+          clang --version | head -1
           echo "aarch64 as: $(command -v aarch64-linux-gnu-as || echo MISSING)"
-          echo "arm32   as: $(command -v arm-linux-gnueabi-as || echo MISSING)"
-          if ! command -v aarch64-linux-gnu-as >/dev/null; then
-            echo "::warning::aarch64-linux-gnu-as missing - falling back to integrated assembler"
-            echo "USE_IAS=1" >> $GITHUB_ENV
-          fi
           aarch64-linux-gnu-as --version | head -1 || true
+          ld.lld --version | head -1 || true
 
       - name: Set up ccache
         run: |
           echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> $GITHUB_ENV
-          echo "PATH=/usr/lib/ccache/bin:$PATH" >> $GITHUB_ENV
           mkdir -p "${GITHUB_WORKSPACE}/.ccache"
           ccache --max-size=5G || true
 
+      # ccache is keyed on the toolchain: objects built by LLVM 22 must not
+      # be reused in an LLVM 13 build, or you get a silently mixed kernel.
       - name: Restore ccache
         if: ${{ inputs.clean != true }}
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          key: ccache-${{ inputs.toolchain }}-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ github.ref_name }}-
-            ccache-
-
-      - name: Detect container toolchain
-        run: |
-          if command -v clang >/dev/null 2>&1; then
-            echo "Found: $(clang --version | head -1)"
-            echo "TC_DIR=$(dirname "$(dirname "$(command -v clang)")")" >> $GITHUB_ENV
-          else
-            echo "No clang in container; build.sh will fetch Neutron Clang."
-          fi
-
-      - name: Apply integrated-assembler override
-        if: ${{ inputs.use_ias == true }}
-        run: echo "USE_IAS=1" >> $GITHUB_ENV
+            ccache-${{ inputs.toolchain }}-${{ github.ref_name }}-
+            ccache-${{ inputs.toolchain }}-
 
       - name: Show tree info
         run: |
+          echo "--- kernel version ---"
+          awk -F'= *' '/^VERSION *=/{v=$2} /^PATCHLEVEL *=/{p=$2} /^SUBLEVEL *=/{s=$2} END{print v"."p"."s}' Makefile
           echo "--- KernelSU present? ---"
-          ls -d drivers/kernelsu KernelSU KernelSU-Next 2>/dev/null || echo "none found"
+          ls -d drivers/kernelsu KernelSU KernelSU-Next 2>/dev/null || echo "none"
           echo "--- defconfig markers ---"
-          grep -E "^CONFIG_(LOCALVERSION|KSU)" arch/arm64/configs/lavender_defconfig || true
+          grep -E "^CONFIG_(LOCALVERSION|KSU|MODULES)" arch/arm64/configs/lavender_defconfig || true
 
       - name: Build
         run: |
+          export PATH="${TC_DIR}/bin:$PATH"
           chmod +x build.sh
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-             && [ "${{ inputs.susfs }}" != "true" ]; then
-            ./build.sh
-          else
+          if [ "${{ inputs.susfs }}" = "true" ]; then
             ./build.sh --susfs
+          else
+            ./build.sh
           fi
 
-      # Rejected hunks are a likely first-run failure on 4.19.
-      # Print them in the log AND upload them.
       - name: Collect patch rejects
         if: failure()
         run: |
@@ -110,12 +124,9 @@ jobs:
           find . -name '*.rej' -exec cp --parents {} /tmp/rejects/ \; 2>/dev/null || true
           echo "===== REJECTED HUNKS ====="
           find /tmp/rejects -name '*.rej' | while read -r f; do
-            echo "########## $f ##########"
-            cat "$f"
+            echo "########## $f ##########"; cat "$f"
           done
-          if [ -z "$(find /tmp/rejects -name '*.rej' 2>/dev/null)" ]; then
-            echo "(none - failure was not in the patch step)"
-          fi
+          [ -z "$(find /tmp/rejects -name '*.rej' 2>/dev/null)" ] && echo "(none)"
 
       - name: Upload rejects
         if: failure()
@@ -128,18 +139,17 @@ jobs:
       - name: Upload kernel
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-lavender-${{ github.run_number }}
+          name: kernel-${{ inputs.toolchain }}-${{ github.run_number }}
           path: |
             *.zip
             out/arch/arm64/boot/Image.gz-dtb
           if-no-files-found: error
 
-      # Read this to confirm CONFIG_KSU_SUSFS=y actually survived.
       - name: Upload config
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-config-${{ github.run_number }}
+          name: config-${{ github.run_number }}
           path: out/.config
           if-no-files-found: ignore
 
@@ -148,4 +158,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          key: ccache-${{ inputs.toolchain }}-${{ github.ref_name }}-${{ github.sha }}
