@@ -1,0 +1,151 @@
+name: Build Kernel
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+    inputs:
+      susfs:
+        description: "Integrate SUSFS"
+        type: boolean
+        default: true
+      clean:
+        description: "Ignore ccache and build clean"
+        type: boolean
+        default: false
+      use_ias:
+        description: "Use clang's integrated assembler instead of GNU as"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: nexgang/ubuntu:latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # NOTE: no "|| true" on the cross-binutils install. Without
+      # aarch64-linux-gnu-as, clang falls back to the host x86 assembler
+      # and dies with "/usr/bin/as: unrecognized option '-EL'".
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || true
+          apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev build-essential git zip unzip curl \
+            ccache libncurses-dev python3 device-tree-compiler \
+            ca-certificates patch || true
+          apt-get install -y --no-install-recommends \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Verify cross assembler
+        run: |
+          echo "aarch64 as: $(command -v aarch64-linux-gnu-as || echo MISSING)"
+          echo "arm32   as: $(command -v arm-linux-gnueabi-as || echo MISSING)"
+          if ! command -v aarch64-linux-gnu-as >/dev/null; then
+            echo "::warning::aarch64-linux-gnu-as missing - falling back to integrated assembler"
+            echo "USE_IAS=1" >> $GITHUB_ENV
+          fi
+          aarch64-linux-gnu-as --version | head -1 || true
+
+      - name: Set up ccache
+        run: |
+          echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> $GITHUB_ENV
+          echo "PATH=/usr/lib/ccache/bin:$PATH" >> $GITHUB_ENV
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
+          ccache --max-size=5G || true
+
+      - name: Restore ccache
+        if: ${{ inputs.clean != true }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-
+            ccache-
+
+      - name: Detect container toolchain
+        run: |
+          if command -v clang >/dev/null 2>&1; then
+            echo "Found: $(clang --version | head -1)"
+            echo "TC_DIR=$(dirname "$(dirname "$(command -v clang)")")" >> $GITHUB_ENV
+          else
+            echo "No clang in container; build.sh will fetch Neutron Clang."
+          fi
+
+      - name: Apply integrated-assembler override
+        if: ${{ inputs.use_ias == true }}
+        run: echo "USE_IAS=1" >> $GITHUB_ENV
+
+      - name: Show tree info
+        run: |
+          echo "--- KernelSU present? ---"
+          ls -d drivers/kernelsu KernelSU KernelSU-Next 2>/dev/null || echo "none found"
+          echo "--- defconfig markers ---"
+          grep -E "^CONFIG_(LOCALVERSION|KSU)" arch/arm64/configs/lavender_defconfig || true
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.susfs }}" != "true" ]; then
+            ./build.sh
+          else
+            ./build.sh --susfs
+          fi
+
+      # Rejected hunks are a likely first-run failure on 4.19.
+      # Print them in the log AND upload them.
+      - name: Collect patch rejects
+        if: failure()
+        run: |
+          mkdir -p /tmp/rejects
+          find . -name '*.rej' -exec cp --parents {} /tmp/rejects/ \; 2>/dev/null || true
+          echo "===== REJECTED HUNKS ====="
+          find /tmp/rejects -name '*.rej' | while read -r f; do
+            echo "########## $f ##########"
+            cat "$f"
+          done
+          if [ -z "$(find /tmp/rejects -name '*.rej' 2>/dev/null)" ]; then
+            echo "(none - failure was not in the patch step)"
+          fi
+
+      - name: Upload rejects
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects
+          path: /tmp/rejects
+          if-no-files-found: ignore
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-lavender-${{ github.run_number }}
+          path: |
+            *.zip
+            out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+
+      # Read this to confirm CONFIG_KSU_SUSFS=y actually survived.
+      - name: Upload config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config-${{ github.run_number }}
+          path: out/.config
+          if-no-files-found: ignore
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
